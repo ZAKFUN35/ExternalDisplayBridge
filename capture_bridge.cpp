@@ -2,13 +2,15 @@
  * External Display Bridge v3.0 — C++ / DirectX 11
  *
  * Ключевые оптимизации:
- *   - Нет cv::cvtColor: сырые BGR данные идут напрямую в GPU
+ *   - Один cv::cvtColor на весь кадр (не на каждую строку) + GPU-swizzle в шейдере
  *   - GPU Swizzling: BGR→RGB перестановка в HLSL пиксельном шейдере
  *   - Zero-Copy Upload: D3D11_MAP_WRITE_DISCARD, только добавляем alpha=255
  *   - Triple Buffering: атомарный свап без мьютексов
  *   - Адаптивный рендерер: автопересоздание текстуры при смене разрешения
  *   - FPS оверлей без .clone(): рисуем прямо в буфер
- *   - MMCSS "Pro Audio" / "Games", REALTIME_PRIORITY_CLASS
+ *   - MMCSS "Pro Audio" / "Games", HIGH_PRIORITY_CLASS
+ *   - Event-driven рендер: главный поток спит на HANDLE, будится по SetEvent от захвата
+ *     (не полирует один и тот же кадр на полной скорости — меньше нагрузка/шум)
  *   - Интерактивный выбор устройства при запуске
  *   - Настраиваемые клавиши управления (сохранение в keybindings.bin)
  *
@@ -18,7 +20,7 @@
  *   cl /O2 /EHsc /std:c++17 capture_bridge.cpp ^
  *      /I"C:\Users\Кирилл\Downloads\opencv\build\include" ^
  *      /link /LIBPATH:"C:\Users\Кирилл\Downloads\opencv\build\x64\vc16\lib" ^
- *      opencv_world4120.lib d3d11.lib dxgi.lib d3dcompiler.lib avrt.lib ^
+ *      opencv_world4120.lib d3d11.lib dxgi.lib d3dcompiler.lib avrt.lib pdh.lib ^
  *      user32.lib kernel32.lib ole32.lib oleaut32.lib strmiids.lib
  */
 
@@ -36,6 +38,7 @@
 #include <dxgi1_2.h>      // DXGI 1.2 - IDXGISwapChain1 и IDXGIFactory2 живут здесь
 #include <dxgi1_5.h>      // DXGI 1.5 - нужен для проверки поддержки тиринга (Allow Tearing)
 #include <d3dcompiler.h>  // рантайм-компилятор HLSL - компилируем шейдеры из строк прямо при запуске
+#include <pdh.h>          // Performance Data Helper - те же счетчики "GPU Engine", что видит Task Manager
 
 #include <atomic>     // std::atomic - безлоковый обмен данными между потоками
 #include <array>      // std::array - фиксированный массив для тройного буфера
@@ -47,6 +50,7 @@
 #include <vector>     // std::vector - список найденных видео-устройств
 #include <fstream>    // std::ifstream / std::ofstream - читаем и пишем keybindings.bin
 #include <cstring>    // memcpy - копируем строки пикселей в текстуру побайтово
+#include <cstdint>    // uint8_t - буфер под PDH-счетчики
 
 #include <opencv2/imgproc.hpp>  // cv::cvtColor, cv::putText - конвертация цветов и FPS-текст
 #include <opencv2/videoio.hpp>  // cv::VideoCapture - захват с камеры / capture-карты
@@ -56,6 +60,7 @@
 static std::atomic<bool> g_running { true  };  // пока true - главный цикл крутится, false - всё, выходим
 static std::atomic<bool> g_showFPS  { false };  // показывать ли FPS-оверлей - по умолчанию выключен
 static std::atomic<bool> g_vsync    { false };  // VSync вкл/выкл - atomic потому что читается из двух потоков
+static std::atomic<uint64_t> g_captureFrameCount { 0 };  // инкрементируется в TripleBuffer::commitWrite - по нему считаем реальный FPS с карты захвата
 
 // ─── UI helpers ──────────────────────────────────────────────────────────────
 // Все блоки шириной 50 символов внутри (52 с рамкой), отступ 2 пробела слева.
@@ -446,9 +451,8 @@ static void showCursor()   { while (ShowCursor(TRUE)  <  0) {} }  // обрат�
 
 static void setProcessPriority()
 {
-    HANDLE h = GetCurrentProcess();  // хендл нашего процесса
-    if (!SetPriorityClass(h, REALTIME_PRIORITY_CLASS))  // пробуем REALTIME - нужны права администратора
-        SetPriorityClass(h, HIGH_PRIORITY_CLASS);        // fallback - HIGH тоже хорошо, без прав адмнистратора
+    HANDLE h = GetCurrentProcess();            // хендл нашего процесса
+    SetPriorityClass(h, HIGH_PRIORITY_CLASS);  // HIGH достаточно - REALTIME рискован (может морозить систему) и не нужен для этой задачи
 }
 
 static HANDLE registerMMCSS(const wchar_t* task)
@@ -562,12 +566,17 @@ struct TripleBuffer {
     std::array<cv::Mat, 3> bufs;       // три кадра: один пишет поток захвата, один читает рендерер, третий в запасе
     std::atomic<int> latest  { -1 };   // индекс последнего записанного кадра, -1 = кадров ещё не было
     std::atomic<int> writing {  0 };   // в какой слот сейчас пишет поток захвата
+    HANDLE frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset событие - сигналим главному потоку о новом кадре без Sleep-опроса
+
+    ~TripleBuffer() { if (frameEvent) CloseHandle(frameEvent); }  // закрываем хендл при разрушении буфера
 
     void commitWrite()
     {
         int w = writing.load(std::memory_order_relaxed);   // узнаем в какой слот только что записали
         latest.store(w, std::memory_order_release);         // публикуем - теперь рендерер видит новый кадр
         writing.store((w + 1) % 3, std::memory_order_relaxed);  // переключаем на следующий слот по кругу
+        g_captureFrameCount.fetch_add(1, std::memory_order_relaxed);  // считаем реальный поток кадров с карты - для Source FPS в оверлее
+        if (frameEvent) SetEvent(frameEvent);  // будим главный поток немедленно - он ждёт этот ивент вместо Sleep(1)
     }
 
     cv::Mat* tryRead()
@@ -614,7 +623,7 @@ public:
 private:
     void captureLoop()
     {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);  // максимальный приоритет потока - пропускаем вперед всех
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);  // высокий приоритет потока - TIME_CRITICAL был избыточен
         HANDLE mmh = registerMMCSS(L"Pro Audio");  // "Pro Audio" - самый высокий профиль MMCSS, даже выше "Games"
 
         while (running_) {
@@ -804,19 +813,26 @@ struct DX11Renderer {
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         if (FAILED(ctx->Map(dynTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;  // WRITE_DISCARD - говорим GPU что перезаписываем всё, он не ждет завершения предыдущего кадра
 
-        const uint8_t* src = frame.ptr(0);           // указатель на начало пикселей OpenCV кадра
-        uint8_t*       dst = static_cast<uint8_t*>(mapped.pData);  // указатель на память текстуры после Map
-        const int      W   = frame.cols;
-        const int      H   = frame.rows;
-        const int      srcStep  = static_cast<int>(frame.step[0]);  // размер строки в OpenCV - может быть с паддингом
-        const UINT     dstPitch = mapped.RowPitch;                   // размер строки в DX текстуре - тоже может быть с паддингом, другим
+        const int  W        = frame.cols;
+        const int  H        = frame.rows;
+        const UINT dstPitch = mapped.RowPitch;  // размер строки в DX текстуре - может быть с паддингом, отличным от исходного
 
-        thread_local cv::Mat bgraRow;  // thread_local - аллоцируем один раз на поток, не каждый кадр
-        for (int y = 0; y < H; ++y) {
-            const cv::Mat srcRow(1, W, CV_8UC3, const_cast<uint8_t*>(src + y * srcStep));  // вью на одну строку BGR без копирования
-            bgraRow.create(1, W, CV_8UC4);                                                  // выделяем строку BGRA если ещё не выделено
-            cv::cvtColor(srcRow, bgraRow, cv::COLOR_BGR2BGRA);                              // BGR -> BGRA, добавляем alpha=255
-            memcpy(dst + y * dstPitch, bgraRow.ptr(0), W * 4);                             // копируем строку в текстуру с учетом DX-pitch
+        // ОДИН вызов cvtColor на весь кадр, а не по одному на каждую из 1080 строк -
+        // раньше это было ~64800 вызовов/сек на 60 fps, теперь 60. Сама конвертация
+        // (добавление альфа-байта) не исчезла - она просто больше не размазана на
+        // тысячи мелких вызовов с накладными расходами на каждый.
+        thread_local cv::Mat bgraFull;
+        cv::cvtColor(frame, bgraFull, cv::COLOR_BGR2BGRA);
+
+        const uint8_t* src     = bgraFull.ptr(0);
+        uint8_t*       dst     = static_cast<uint8_t*>(mapped.pData);
+        const int      srcStep = static_cast<int>(bgraFull.step[0]);
+
+        if (static_cast<UINT>(srcStep) == dstPitch) {
+            memcpy(dst, src, static_cast<size_t>(srcStep) * H);  // шаг строки совпал - копируем всё одним memcpy
+        } else {
+            for (int y = 0; y < H; ++y)                          // разный шаг (паддинг) - копируем построчно, БЕЗ конвертации цвета в цикле
+                memcpy(dst + y * dstPitch, src + y * srcStep, W * 4);
         }
         ctx->Unmap(dynTex, 0);  // анмапим - GPU может снова читать текстуру
     }
@@ -906,17 +922,147 @@ static HWND createFullscreenWindow(int& outW, int& outH)
     return hwnd;
 }
 
+// ─── Мониторинг нагрузки CPU/GPU для оверлея ────────────────────────────────
+//
+// Работает в отдельном низкоприоритетном потоке и опрашивает системные
+// счетчики примерно раз в секунду - этого достаточно для читаемого числа
+// на экране, но не создает нагрузки. Результат кладется в атомики; рендер
+// только читает их (это не системный вызов - несколько наносекунд), поэтому
+// на FPS/задержку захвата и вывода это не влияет.
+
+static std::atomic<float> g_cpuPercent  { -1.0f };  // -1 = еще не измерено / недоступно
+static std::atomic<float> g_gpuPercent  { -1.0f };  // -1 = счетчик недоступен / еще не измерено
+static std::atomic<float> g_sourceFps   { -1.0f };  // реальный fps потока с карты захвата (обычно стабильно ~60, не зависит от того, рисуем мы кадр или пропускаем)
+static std::atomic<bool>  g_monitorRunning { true };
+
+// Загрузка CPU считается по дельте между двумя вызовами GetSystemTimes -
+// системный (kernel) счетчик уже включает idle-время, поэтому busy = total - idle.
+static float pollCpuPercent()
+{
+    static ULARGE_INTEGER prevIdle{}, prevKernel{}, prevUser{};  // статики метода - живут между вызовами из потока монитора
+    static bool first = true;                                    // первый вызов дает только базу для дельты
+
+    FILETIME idleFT{}, kernelFT{}, userFT{};
+    if (!GetSystemTimes(&idleFT, &kernelFT, &userFT)) return -1.0f;  // не смогли получить времена - счетчик недоступен
+
+    ULARGE_INTEGER idle, kernel, user;
+    idle.LowPart   = idleFT.dwLowDateTime;   idle.HighPart   = idleFT.dwHighDateTime;
+    kernel.LowPart = kernelFT.dwLowDateTime; kernel.HighPart = kernelFT.dwHighDateTime;
+    user.LowPart   = userFT.dwLowDateTime;   user.HighPart   = userFT.dwHighDateTime;
+
+    float result = 0.0f;
+    if (!first) {
+        ULONGLONG idleDiff   = idle.QuadPart   - prevIdle.QuadPart;
+        ULONGLONG kernelDiff = kernel.QuadPart - prevKernel.QuadPart;  // включает idle - так возвращает WinAPI
+        ULONGLONG userDiff   = user.QuadPart   - prevUser.QuadPart;
+        ULONGLONG totalDiff  = kernelDiff + userDiff;
+        if (totalDiff > 0)
+            result = static_cast<float>(totalDiff - idleDiff) * 100.0f / static_cast<float>(totalDiff);
+    }
+    first = false;
+    prevIdle = idle; prevKernel = kernel; prevUser = user;
+    return result;
+}
+
+// Загрузка GPU через PDH-счетчик "GPU Engine" - тот же источник данных,
+// которым пользуется диспетчер задач. Суммируем 3D-движок по всем процессам:
+// это движок, который грузит наш D3D11-рендер, и он ближе всего к тому, что
+// обычно понимают под "загрузка GPU". Это приближение, не побитовая копия
+// числа из диспетчера задач (там алгоритм чуть сложнее), но для диагностики
+// достаточно точно. Работает без вендор-специфичных SDK (NVML/ADL) - то есть
+// на любой видеокарте, начиная с Windows 10.
+struct GpuLoadMonitor {
+    PDH_HQUERY   query   = nullptr;
+    PDH_HCOUNTER counter = nullptr;
+    bool         ok      = false;
+
+    GpuLoadMonitor()
+    {
+        if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) return;  // не смогли открыть PDH-сессию
+        if (PdhAddEnglishCounterW(query,
+                L"\\GPU Engine(*)\\Utilization Percentage",
+                0, &counter) != ERROR_SUCCESS) {
+            PdhCloseQuery(query); query = nullptr; return;  // счетчик недоступен (старая Windows / нет GPU-драйвера с поддержкой) - GPU% будет "n/a"
+        }
+        PdhCollectQueryData(query);  // первый сбор - только база, значение еще не показательно
+        ok = true;
+    }
+
+    ~GpuLoadMonitor() { if (query) PdhCloseQuery(query); }
+
+    float poll()
+    {
+        if (!ok) return -1.0f;
+        if (PdhCollectQueryData(query) != ERROR_SUCCESS) return -1.0f;
+
+        DWORD bufSize = 0, itemCount = 0;
+        PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufSize, &itemCount, nullptr);  // узнаем нужный размер буфера
+        if (bufSize == 0) return 0.0f;  // нет активных инстансов движков - GPU простаивает
+
+        std::vector<uint8_t> buf(bufSize);
+        auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
+        if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &bufSize, &itemCount, items) != ERROR_SUCCESS)
+            return -1.0f;
+
+        double sum = 0.0;  // суммируем только 3D-движок - остальные (Copy/VideoDecode/...) в нашем случае почти не используются
+        for (DWORD i = 0; i < itemCount; ++i) {
+            if (items[i].FmtValue.CStatus != ERROR_SUCCESS) continue;
+            std::wstring name(items[i].szName);
+            if (name.find(L"engtype_3D") != std::wstring::npos)
+                sum += items[i].FmtValue.doubleValue;
+        }
+        return static_cast<float>((std::min)(sum, 100.0));  // клампим - сумма по инстансам иногда чуть переваливает за 100 из-за округления
+    }
+};
+
+static void loadMonitorLoop()
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);  // фоновая задача - не должна мешать захвату/рендеру ни на йоту
+    GpuLoadMonitor gpu;
+    pollCpuPercent();  // первый вызов - только база для дельты CPU, результат не используем
+
+    uint64_t prevCaptureCount = g_captureFrameCount.load(std::memory_order_relaxed);
+    auto     prevSampleTime   = std::chrono::steady_clock::now();
+
+    while (g_monitorRunning) {
+        for (int i = 0; i < 10 && g_monitorRunning; ++i) Sleep(100);  // ждем ~1с шагами по 100мс - быстрее реагируем на завершение
+        if (!g_monitorRunning) break;
+        g_cpuPercent = pollCpuPercent();
+        g_gpuPercent = gpu.poll();
+
+        uint64_t curCaptureCount = g_captureFrameCount.load(std::memory_order_relaxed);
+        auto     now             = std::chrono::steady_clock::now();
+        double   elapsedSec      = std::chrono::duration<double>(now - prevSampleTime).count();
+        if (elapsedSec > 0.0)
+            g_sourceFps = static_cast<float>(static_cast<double>(curCaptureCount - prevCaptureCount) / elapsedSec);
+        prevCaptureCount = curCaptureCount;
+        prevSampleTime   = now;
+    }
+}
+
 // ─── FPS оверлей ─────────────────────────────────────────────────────────────
 
-static void drawFPS(cv::Mat* frame, double fps, const char* codec)
+static void drawFPS(cv::Mat* frame, double renderFps, const char* codec)
 {
     if (!frame || frame->empty()) return;  // на всякий случай - нулевой или пустой кадр не трогаем
-    char buf[80];
+    char buf[160];
     const char* vsyncStr = g_vsync.load() ? "VSync ON" : "VSync OFF";
-    snprintf(buf, sizeof(buf), "FPS: %d | %s | %s", (int)fps, codec, vsyncStr);  // форматируем строку оверлея
+
+    char cpuStr[16], gpuStr[16], srcStr[16];
+    float cpu = g_cpuPercent.load();
+    float gpu = g_gpuPercent.load();
+    float src = g_sourceFps.load();
+    if (cpu >= 0.0f) snprintf(cpuStr, sizeof(cpuStr), "%.0f%%", cpu); else snprintf(cpuStr, sizeof(cpuStr), "n/a");
+    if (gpu >= 0.0f) snprintf(gpuStr, sizeof(gpuStr), "%.0f%%", gpu); else snprintf(gpuStr, sizeof(gpuStr), "n/a");
+    if (src >= 0.0f) snprintf(srcStr, sizeof(srcStr), "%.0f", src); else snprintf(srcStr, sizeof(srcStr), "n/a");
+
+    // Render FPS - сколько раз в секунду реально что-то отрисовали (падает почти до нуля на статичной картинке).
+    // Source FPS - сколько кадров реально прислала карта захвата (стабильно, от нас не зависит).
+    snprintf(buf, sizeof(buf), "Render: %d fps | Source: %s fps | %s | %s | CPU %s | GPU %s",
+             (int)renderFps, srcStr, codec, vsyncStr, cpuStr, gpuStr);  // форматируем строку оверлея
     cv::putText(*frame, buf,
                 cv::Point(20, frame->rows - 20),  // левый нижний угол - не мешает контенту
-                cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                cv::FONT_HERSHEY_SIMPLEX, 0.5,
                 cv::Scalar(160, 160, 160), 1, cv::LINE_AA);  // серый текст с антиалиасингом - видно но не бросается в глаза
 }
 
@@ -1000,12 +1146,17 @@ int main()
         vs.stop(); allowSleep(); return 1;  // DX11 не поднялся - останавливаем захват и выходим
     }
 
+    std::thread loadMonitorThread(loadMonitorLoop);  // фоновый мониторинг CPU/GPU для оверлея - см. комментарий у loadMonitorLoop
+
     auto prevTime = std::chrono::steady_clock::now();  // точка отсчета для FPS-счетчика
 
     // ── Состояния клавиш (защита от дребезга) ────────────────────────────────
     KeyState ksFPS, ksVSync, ksExit;  // три отдельных трекера для трёх биндингов
 
     // ── Главный цикл ─────────────────────────────────────────────────────────
+    int lastRenderedIdx = -1;   // индекс последнего отрисованного кадра - не даём рисовать один и тот же кадр повторно
+    cv::Mat prevSnapshot;       // содержимое последнего РЕАЛЬНО отрисованного кадра - для сравнения "картинка изменилась или нет"
+
     while (g_running) {
         // 1. Системные сообщения
         MSG msg;
@@ -1021,9 +1172,39 @@ int main()
         if (ksVSync.poll(kb.vkVSync)) g_vsync   = !g_vsync.load();    // тоглим VSync
         if (ksExit.poll(kb.vkExit))   g_running = false;              // выход
 
-        // 3. Захват и вывод кадра
-        cv::Mat* framePtr = tb.tryRead();
-        if (!framePtr || framePtr->empty()) { Sleep(1); continue; }  // кадра ещё нет - ждем 1мс и пробуем снова
+        // 3. Ждём новый кадр. SetEvent в commitWrite будит нас практически мгновенно,
+        //    так что таймаут 5мс — это просто страховка, чтобы не залипнуть и продолжать
+        //    крутить пункты 1-2 (сообщения окна, клавиши), даже если кадров вдруг нет.
+        WaitForSingleObject(tb.frameEvent, 5);
+
+        int currentIdx = tb.latest.load(std::memory_order_acquire);
+        if (currentIdx == lastRenderedIdx || currentIdx < 0) continue;  // кадр не новый - на следующую итерацию, без рендера
+        lastRenderedIdx = currentIdx;
+
+        cv::Mat* framePtr = &tb.bufs[currentIdx];
+        if (framePtr->empty()) continue;  // на всякий случай - пустой кадр не рендерим
+
+        // 4. Динамическое масштабирование нагрузки (как адаптивный refresh rate на телефонах):
+        //    если картинка не изменилась ни на байт с прошлого РЕАЛЬНО отрисованного кадра -
+        //    пропускаем конвертацию цвета, загрузку в GPU и Present целиком. Экран просто
+        //    продолжает показывать то, что уже выведено - кадр физически идентичен, поэтому
+        //    никакого мигания или подтормаживания не возникает. Как только появляется реальное
+        //    изменение - оно рендерится следующим же тактом, задержку это не увеличивает,
+        //    т.к. сравнение делается на каждом кадре, а не по таймеру.
+        bool changed;
+        if (prevSnapshot.empty() || prevSnapshot.size() != framePtr->size()
+            || prevSnapshot.type() != framePtr->type() || !framePtr->isContinuous()) {
+            changed = true;  // первый кадр / сменилось разрешение / память не сплошная - на всякий случай считаем что изменилось
+        } else {
+            const size_t bytes = framePtr->total() * framePtr->elemSize();
+            changed = (std::memcmp(prevSnapshot.data, framePtr->data, bytes) != 0);
+        }
+        if (!changed) continue;  // картинка идентична предыдущей - экономим CPU/GPU, ничего не рисуем
+
+        if (prevSnapshot.size() != framePtr->size() || prevSnapshot.type() != framePtr->type())
+            prevSnapshot.create(framePtr->size(), framePtr->type());       // разрешение поменялось - переаллоцируем снапшот
+        std::memcpy(prevSnapshot.data, framePtr->data,
+                    framePtr->total() * framePtr->elemSize());             // запоминаем этот кадр как базу для следующего сравнения
 
         auto   now = std::chrono::steady_clock::now();
         double fps = 1e9 / static_cast<double>(
@@ -1039,6 +1220,8 @@ int main()
     }
 
     // ── Очистка ───────────────────────────────────────────────────────────────
+    g_monitorRunning = false;                                // сигналим потоку монитора остановиться
+    if (loadMonitorThread.joinable()) loadMonitorThread.join();  // ждем его завершения - максимум 100мс из-за шага сна
     dx.release();                // освобождаем все DX11 объекты
     vs.stop();                   // останавливаем поток захвата и отпускаем устройство
     DestroyWindow(hwnd);         // уничтожаем окно
